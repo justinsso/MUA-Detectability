@@ -1,0 +1,20 @@
+name: lfpy
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - c-compiler
+  - cxx-compiler
+  - Cython
+  - h5py
+  - jupyter
+  - lfpykit
+  - numpy
+  - matplotlib
+  - mpi4py
+  - pytest
+  - scipy
+  - pip
+  - pip:
+    - neuron>=7.7.2
