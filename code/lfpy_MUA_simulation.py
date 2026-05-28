@@ -16,8 +16,21 @@ from scipy.ndimage import gaussian_filter1d
 # plot immediately; existing figure windows stay open for inspection.
 plt.ion()
 
-# Where to dump PNGs so they can be inspected outside Spyder
-figure_dir = r"C:\Users\zachr\OneDrive\Skrivbord\claude_code\figures"
+# Paths are resolved relative to THIS script's location in the repo so the script
+# is portable across machines (Huxley, laptops, ...) with no hand-editing.
+# Repo layout:  <repo>/code/lfpy_MUA_simulation.py , <repo>/figures , <repo>/LFPy-2.3.6/...
+try:
+    _HERE = os.path.dirname(os.path.abspath(__file__))   # <repo>/code
+except NameError:
+    # __file__ is undefined when run cell-by-cell in an interactive window;
+    # fall back to the current working directory.
+    _HERE = os.path.abspath(os.getcwd())
+_REPO = os.path.dirname(_HERE)                           # <repo>
+
+# Where to dump PNGs so they can be inspected outside Spyder.
+# Default: <repo>/figures. Override with the MUA_FIGURE_DIR env var if you want
+# output on a scratch drive (e.g. on Huxley) without editing this file.
+figure_dir = os.environ.get("MUA_FIGURE_DIR", os.path.join(_REPO, "figures"))
 os.makedirs(figure_dir, exist_ok=True)
 
 # Create a new subfolder per run (timestamped) so each run's figures stay
@@ -31,6 +44,49 @@ def fig_path(name):
     """Return run_dir/<name>.png — figures from one script run live in one folder."""
     base, _ = os.path.splitext(name)
     return os.path.join(run_dir, f"{base}.png")
+
+
+def write_run_info(out_dir, extra=None):
+    """Dump run_info.json into out_dir capturing exactly which code + environment
+    produced this run. The sweep is seeded, so identical code+env should yield
+    identical numbers; this file makes any run-to-run differences attributable
+    (code change vs. package/version change vs. platform)."""
+    import json, socket, platform, subprocess, sys
+
+    def _git(args):
+        try:
+            return subprocess.check_output(
+                ['git'] + args, cwd=_HERE, stderr=subprocess.DEVNULL
+            ).decode().strip()
+        except Exception:
+            return None
+
+    def _ver(modname):
+        try:
+            return getattr(__import__(modname), '__version__', None)
+        except Exception:
+            return None
+
+    info = {
+        'timestamp':  run_stamp,
+        'git_commit': _git(['rev-parse', 'HEAD']),
+        'git_short':  _git(['rev-parse', '--short', 'HEAD']),
+        'git_branch': _git(['rev-parse', '--abbrev-ref', 'HEAD']),
+        'git_dirty':  bool(_git(['status', '--porcelain'])),
+        'hostname':   socket.gethostname(),
+        'platform':   platform.platform(),
+        'python':     sys.version.split()[0],
+        'versions':   {m: _ver(m) for m in ('numpy', 'scipy', 'LFPy', 'neuron', 'matplotlib')},
+        'morph_dir':  morph_dir,
+    }
+    if extra:
+        info.update(extra)
+    try:
+        with open(os.path.join(out_dir, 'run_info.json'), 'w') as f:
+            json.dump(info, f, indent=2)
+    except Exception as e:
+        print(f"[run_info] could not write run_info.json: {e}", flush=True)
+    return info
 
 
 import sys
@@ -59,8 +115,21 @@ sweep_repeats   = 3
 
 # ============ PARAMETERS ============
 # NEURON's HOC interpreter treats "\" as an escape character, so use forward slashes
-# in all morphology paths — even on Windows.
-morph_dir = "C:/Users/zachr/Downloads"
+# in all morphology paths — even on Windows. The morphology ships in the repo at
+# <repo>/LFPy-2.3.6/examples/morphologies, so resolve it relative to this script
+# (portable across machines). .replace() forces forward slashes so NEURON is happy
+# on Windows too.
+morph_dir = os.path.join(_REPO, "LFPy-2.3.6", "examples", "morphologies").replace("\\", "/")
+
+# Fail loudly if the morphology isn't where we expect (e.g. a partial/broken clone),
+# instead of letting every sweep subprocess die silently inside NEURON.
+_primary_morph = os.path.join(morph_dir, "L5_Mainen96_LFPy.hoc")
+if not os.path.isfile(_primary_morph):
+    raise FileNotFoundError(
+        f"Expected morphology not found at {_primary_morph!r} (resolved repo root = {_REPO!r}). "
+        f"Is the repo fully cloned (including LFPy-2.3.6/), and is this script still located "
+        f"at <repo>/code/lfpy_MUA_simulation.py?"
+    )
 
 # Ensure Python's CWD is the morphology directory so NEURON's xopen() always has a
 # valid working directory to fall back on, regardless of where the script is run from.
@@ -705,6 +774,26 @@ if run_sweep:
     log(f"=== Subprocess sweep: {n_N} n_cells × {n_D} distances × {n_J} jitters × {sweep_repeats} reps "
         f"= {total_runs} populations ===")
     log(f"Worker: {worker_script}")
+
+    write_run_info(run_dir, extra={
+        'mode':                 'sweep',
+        'sweep_n_cells':        [int(x) for x in sweep_n_cells],
+        'sweep_distances':      [int(x) for x in sweep_distances],
+        'sweep_jitters':        [float(x) for x in sweep_jitters],
+        'sweep_repeats':        int(sweep_repeats),
+        'total_populations':    int(total_runs),
+        'seed_scheme':          'np.random.seed(abs(hash((distance_idx, ncell_idx, rep))) % (2**31-1)); '
+                                'jitter excluded so jitter comparisons are paired',
+        'tstop_ms':             tstop,
+        'dt_ms':                dt,
+        'noise_rms_uV':         noise_rms_uV,
+        'mua_threshold_factor': mua_threshold_factor,
+        'mua_band_Hz':          [mua_low, mua_high],
+        'filt_order':           filt_order,
+        'drive_mode':           drive_mode,
+        'align_cells':          align_cells,
+    })
+    log(f"Wrote run_info.json -> {os.path.join(run_dir, 'run_info.json')}")
 
     run_idx = 0
     for ij, J in enumerate(sweep_jitters):

@@ -183,6 +183,12 @@ Outputs are time-stamped into a new run folder (`figures/run_<YYYYMMDD_HHMMSS>/`
 - All source: `lfpy_sim.py` (main), `sweep_worker.py` (per-population worker), `snr_vs_distance.py` (calibration)
 - Each run produces a self-contained `run_<timestamp>/` folder with figures, raw arrays, and a reproducible parameter record
 
+### 11.1 Portable paths and per-run provenance
+
+The morphology and figure-output directories are resolved **relative to the script's location in the repository** rather than hardcoded to one machine: `morph_dir` points at the bundled `LFPy-2.3.6/examples/morphologies/` and `figure_dir` defaults to `<repo>/figures` (overridable via the `MUA_FIGURE_DIR` environment variable). Paths use forward slashes so NEURON's HOC interpreter accepts them on Windows. A startup check raises a clear error if the expected morphology file is missing, so a broken or partial clone fails immediately instead of silently inside each NEURON subprocess. This lets the sweep run on any machine (e.g. the lab workstation) after a plain `git clone`, with no path editing.
+
+Each sweep run additionally writes a `run_info.json` into its `run_<timestamp>/` folder, recording the git commit (and dirty flag), hostname, OS/platform, and the LFPy / NEURON / NumPy / SciPy / Matplotlib versions, alongside the sweep grid and seed scheme. Because the sweep is fully seeded, identical code and environment should reproduce identical results; this provenance record makes any run-to-run difference attributable to a specific code, package, or platform change.
+
 
 ## 12. Key references
 
