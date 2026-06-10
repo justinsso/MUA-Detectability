@@ -101,9 +101,11 @@ def parse_args():
     )
     parser.add_argument(
         "--workers",
-        type=int,
-        default=1,
-        help="Number of worker subprocesses to run concurrently. Default: 1.",
+        default="1",
+        help=(
+            "Number of worker subprocesses to run concurrently, or 'auto' to "
+            "let the script choose based on CPU count and available RAM. Default: 1."
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -549,6 +551,43 @@ def print_dry_run(grid, jobs, out_dir, workers, smoke):
         print(f"  ... {len(jobs) - 5} more")
 
 
+_RAM_PER_JOB_GB = 1.5  # conservative estimate for a 100-cell, 200 ms simulation
+
+
+def auto_workers(grid):
+    """Return a worker count based on CPU cores and available RAM."""
+    cpu_cores = os.cpu_count() or 1
+    available_gb = None
+
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().available / 1024 ** 3
+        ram_limit = max(1, int(available_gb / _RAM_PER_JOB_GB))
+    except ImportError:
+        ram_limit = cpu_cores  # no psutil — fall back to CPU count
+
+    recommended = min(cpu_cores, ram_limit)
+    ram_str = f"{available_gb:.1f} GB RAM available, " if available_gb is not None else ""
+    print(
+        f"auto-workers: {cpu_cores} CPU core(s), "
+        f"{ram_str}"
+        f"{_RAM_PER_JOB_GB} GB/job estimate → {recommended} worker(s)"
+    )
+    return recommended
+
+
+def resolve_workers(raw, grid):
+    if isinstance(raw, str) and raw.strip().lower() == "auto":
+        return auto_workers(grid)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"--workers must be a positive integer or 'auto', got: {raw!r}")
+    if value < 1:
+        raise ValueError(f"--workers must be >= 1, got {value}")
+    return value
+
+
 def run_jobs(jobs, workers):
     failures = []
     completed = 0
@@ -582,23 +621,22 @@ def run_jobs(jobs, workers):
 
 def main():
     args = parse_args()
-    if args.workers < 1:
-        raise ValueError("--workers must be >= 1")
 
     validate_static_paths()
     grid = selected_grid(args.smoke)
+    workers = resolve_workers(args.workers, grid)
     out_dir = resolve_out_dir(args.out_dir)
     jobs = build_jobs(grid, out_dir)
 
     if args.dry_run:
-        print_dry_run(grid, jobs, out_dir, args.workers, args.smoke)
+        print_dry_run(grid, jobs, out_dir, workers, args.smoke)
         return 0
 
     ensure_output_dir(out_dir, args.resume)
-    info = run_info(grid, jobs, out_dir, args.workers, args.smoke, args.resume)
+    info = run_info(grid, jobs, out_dir, workers, args.smoke, args.resume)
     write_run_info_once(out_dir, info, args.resume)
 
-    completed, skipped = run_jobs(jobs, args.workers)
+    completed, skipped = run_jobs(jobs, workers)
     missing = [job.result_path for job in jobs if not job.result_path.exists()]
     if missing:
         raise RuntimeError(
