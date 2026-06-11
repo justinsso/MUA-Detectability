@@ -240,6 +240,207 @@ def make_reference_electrode(
     )
 
 
+def apical_axis_unit(cell):
+    """Return the unit vector from the soma center to the farthest segment.
+
+    This reuses the same "apex = farthest compartment" convention as
+    ``dendritic_indices_by_height`` so the orientation axis matches the synapse
+    height filter for the same morphology.
+    """
+    seg_centers = segment_centers(cell)
+    soma_center = seg_centers[cell.somaidx].mean(axis=0)
+    dists_from_soma = np.linalg.norm(seg_centers - soma_center, axis=1)
+    apex = seg_centers[np.argmax(dists_from_soma)]
+    axis = apex - soma_center
+    norm = np.linalg.norm(axis)
+    if norm == 0:
+        raise ValueError("degenerate apical axis: apex coincides with the soma center")
+    return axis / norm
+
+
+def apical_north_pose(cell):
+    """Return ``(rot_x_deg, rot_y_deg, rot_z_deg)`` orienting apical to +Y.
+
+    The angles map the cell's soma->apex axis onto the +Y ("north") axis under
+    LFPy's ``set_rotation('xyz')`` convention: an X-rotation drives the apical
+    axis into the XY-plane, then a Z-rotation lines it up with +Y (no Y-rotation
+    is needed). Apply with :func:`set_reference_pose`, combined with a soma
+    translation to place the cell. Because every cell built from the same
+    morphology starts in the same native pose, all cells receive identical
+    angles, giving a single global "apical north" orientation.
+    """
+    ux, uy, uz = apical_axis_unit(cell)
+    rot_x = np.arctan2(-uz, uy)        # X-rotation drives the z-component to 0
+    r_xy = np.hypot(uy, uz)
+    rot_z = np.arctan2(ux, r_xy)       # Z-rotation maps the result onto +Y
+    return (float(np.degrees(rot_x)), 0.0, float(np.degrees(rot_z)))
+
+
+def volumetric_cell_positions(n_cells, voxel_um=(300.0, 300.0, 300.0), rng=None):
+    """Return ``(n_cells, 3)`` uniform-random soma positions in a centered cube.
+
+    The voxel is centered on the origin, so each axis spans ``[-L/2, +L/2]``.
+    ``rng`` defaults to the global ``numpy.random`` module, so a worker that
+    seeds ``np.random.seed`` controls placement, matching the reference
+    convention.
+    """
+    draw = np.random if rng is None else rng
+    half = np.asarray(voxel_um, dtype=float) / 2.0
+    return draw.uniform(-half, half, size=(int(n_cells), 3))
+
+
+def approach_contact_positions(
+    contact_distances_um,
+    voxel_um=(300.0, 300.0, 300.0),
+    face="+x",
+):
+    """Return contact positions for a contact approaching one face of the voxel.
+
+    The voxel is centered on the origin. For the default ``+x`` face the face
+    center is ``(Lx/2, 0, 0)`` and the contact sits ``distance`` µm out along the
+    outward normal at ``(Lx/2 + distance, 0, 0)``. Returns
+    ``(elec_x, elec_y, elec_z, contact_normal)`` with one entry per distance.
+
+    Distance is measured from the contact center to the approached face center.
+    The contact-normal sign only sets the orientation of the finite-area contact
+    disk, so it is kept at +x to match the reference electrode normal.
+    """
+    if face != "+x":
+        raise ValueError(f"unsupported approach face: {face!r} (only '+x' is implemented)")
+    distances = np.asarray(contact_distances_um, dtype=float)
+    half_x = float(voxel_um[0]) / 2.0
+    elec_x = half_x + distances
+    elec_y = np.zeros_like(distances)
+    elec_z = np.zeros_like(distances)
+    contact_normal = np.tile([1.0, 0.0, 0.0], (distances.size, 1))
+    return elec_x, elec_y, elec_z, contact_normal
+
+
+def simulate_l5_population_mua(args):
+    """Simulate one volumetric L5 population, recording all contacts in one pass.
+
+    Inverts the reference shell geometry: ``n_cells`` cells are placed at
+    uniform-random soma positions inside the voxel with a single global
+    apical-north orientation, one multi-contact electrode carries every approach
+    distance, and each cell's contribution is summed by linear superposition.
+
+    Returns an ``(n_contacts, n_samples)`` array of MUA-band filtered,
+    noise-free traces in µV (one row per contact, ordered to match
+    ``args['elec_x']``). Callers must add Gaussian noise per contact before
+    threshold detection; see ``l5_approach_worker.py`` for the canonical usage.
+    """
+    from mua_metrics import mua_band_filter
+
+    dt = args.get("dt", 2**-4)
+    fs_hz = args.get("fs_hz", 1000.0 / dt)
+    tstart = args.get("tstart", 0)
+    tstop = args.get("tstop", 200)
+
+    elec_x = np.asarray(args["elec_x"], dtype=float)
+    elec_y = np.asarray(args["elec_y"], dtype=float)
+    elec_z = np.asarray(args["elec_z"], dtype=float)
+    n_contacts = elec_x.size
+    contact_normal = args.get("contact_normal")
+
+    n_cells = int(args["n_cells"])
+    voxel_um = args.get("voxel_um", (300.0, 300.0, 300.0))
+    morphologies = args["morphologies"]
+    drive_mode = args.get("drive_mode", "synapses")
+
+    accumulated = None
+    placed = 0
+    with neuron_working_directory(args.get("morph_dir")):
+        positions = volumetric_cell_positions(n_cells, voxel_um)
+        for cell_index in range(n_cells):
+            morphology = morphologies[np.random.randint(len(morphologies))]
+            cell = make_reference_cell(
+                morphology=morphology,
+                v_init=args.get("v_init", -65),
+                passive=False,
+                dt=dt,
+                tstart=tstart,
+                tstop=tstop,
+            )
+            rot_x, rot_y, rot_z = apical_north_pose(cell)
+            soma_x, soma_y, soma_z = positions[cell_index]
+            set_reference_pose(
+                cell,
+                x=soma_x,
+                y=soma_y,
+                z=soma_z,
+                rot_x=rot_x,
+                rot_y=rot_y,
+                rot_z=rot_z,
+            )
+
+            spike_time = max(
+                1.0,
+                args.get("base_spike_time", 20.0)
+                + np.random.normal(0, args.get("jitter_std", 0.0)),
+            )
+            if drive_mode == "synapses":
+                keepalive = place_reference_synapses(
+                    cell,
+                    spike_time=spike_time,
+                    n_synapses=args.get("n_synapses", 20),
+                    syn_type=args.get("syn_type", "Exp2Syn"),
+                    syn_weight=args.get("syn_weight", 0.05),
+                    tau1=args.get("tau1", 0.5),
+                    tau2=args.get("tau2", 2.0),
+                    e_syn=args.get("e_syn", 0),
+                    syn_height_min=args.get("syn_height_min", 0.5),
+                    syn_height_max=args.get("syn_height_max", 0.9),
+                    record_current=args.get("record_synapse_current", False),
+                    rng_seed=args.get("synapse_rng_seed", 0),
+                    cell_label=cell_index,
+                )
+            elif drive_mode == "iclamp":
+                keepalive = [
+                    place_reference_iclamp(
+                        cell,
+                        spike_time=spike_time,
+                        iclamp_amp=args.get("iclamp_amp", 10),
+                        iclamp_dur=args.get("iclamp_dur", 0.1),
+                    )
+                ]
+            else:
+                raise ValueError(f"Unknown drive_mode: {drive_mode!r} (use 'synapses' or 'iclamp')")
+
+            electrode = make_reference_electrode(
+                cell,
+                elec_x=elec_x,
+                elec_y=elec_y,
+                elec_z=elec_z,
+                sigma=args.get("sigma", 0.3),
+                method=args.get("method", "linesource"),
+                contact_normal=contact_normal,
+                contact_size=args.get("contact_size", 12.0),
+                n_avg_points=args.get("n_avg_points", 50),
+                contact_shape=args.get("contact_shape", "square"),
+            )
+            cell.simulate(rec_imem=True, probes=[electrode])
+            contribution = electrode.data
+            accumulated = contribution.copy() if accumulated is None else accumulated + contribution
+            placed += 1
+            del keepalive, electrode, cell
+
+    if placed == 0 or accumulated is None:
+        n_samples = int(round((tstop - tstart) / dt)) + 1
+        return np.zeros((n_contacts, n_samples))
+
+    raw_uV = accumulated * 1000.0
+    filtered = np.empty_like(raw_uV)
+    for contact_index in range(n_contacts):
+        filtered[contact_index] = mua_band_filter(
+            raw_uV[contact_index],
+            fs_hz,
+            low=args.get("mua_low", 300.0),
+            high=args.get("mua_high", 5000.0),
+            order=args.get("filt_order", 3),
+        )
+    return filtered
+
+
 def random_reference_cell_spec(args):
     """Draw one cell's position, rotation, morphology, and spike time."""
     angle = np.random.uniform(0, 2 * np.pi)
