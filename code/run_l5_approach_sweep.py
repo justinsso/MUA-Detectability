@@ -25,7 +25,7 @@ import platform
 import socket
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +98,16 @@ def parse_args():
         "--smoke",
         action="store_true",
         help="Use the 10-cell smoke population (all 13 contact distances, 1 repeat).",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=None,
+        help=(
+            "Number of independent population realizations (each a distinct "
+            "placement + noise seed). Overrides the default (1). Repeats are "
+            "separate jobs, so --workers parallelizes them."
+        ),
     )
     parser.add_argument(
         "--workers",
@@ -612,6 +622,10 @@ def main():
 
     validate_static_paths()
     grid = selected_grid(args.smoke)
+    if args.repeats is not None:
+        if args.repeats < 1:
+            raise ValueError(f"--repeats must be >= 1, got {args.repeats}")
+        grid = replace(grid, repeats=args.repeats)
     workers = resolve_workers(args.workers)
     out_dir = resolve_out_dir(args.out_dir)
     jobs = build_jobs(grid, out_dir)
