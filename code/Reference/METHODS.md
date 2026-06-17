@@ -132,13 +132,13 @@ Total: 6 × 6 × 7 × 3 = 756 populations (each containing N individual cells).
 
 To increase the statistical efficiency of the jitter comparison, the pseudorandom seed used to generate cell positions, orientations, synapse placements, and noise realizations depends on the tuple (D, N, repeat) but **not** on σ_jitter. Every jitter value at a given grid point therefore simulates the identical cell layout and noise realization — only the jitter parameter changes.
 
-This is a paired-comparison (common random numbers) design familiar from Monte Carlo variance reduction: Var(X_highjitter − X_lowjitter) is dramatically smaller than Var(X_high) + Var(X_low) when the variates share their random inputs, so jitter-specific effects are detectable at far fewer repeats. The stable `hashlib`-based seed scheme that realizes this design in the refactored runner is described in Section 12.4.
+This is a paired-comparison (common random numbers) design familiar from Monte Carlo variance reduction: Var(X_highjitter − X_lowjitter) is dramatically smaller than Var(X_high) + Var(X_low) when the variates share their random inputs, so jitter-specific effects are detectable at far fewer repeats.
 
 ### 7.2 NEURON state isolation
 
-Running hundreds of populations inside a single Python process failed reliably at ~440 cells due to NEURON's internal state (section name table, load_file bookkeeping on Windows) corrupting across `LFPy.Cell` instantiations. The fix implemented here is **one subprocess per population**: a worker script (`sweep_worker.py`) receives a pickled parameter dict, constructs N cells in a fresh Python + NEURON process, records the extracellular trace, applies the full detection pipeline, and writes a result pickle back before exiting. In the refactored runner (`run_reference_sweep.py`, Section 12.2) the parent process dispatches these worker subprocesses concurrently up to a configurable `--workers` count, while each population/repeat still executes in its own clean process.
+Running hundreds of populations inside a single Python process failed reliably at ~440 cells due to NEURON's internal state (section name table, load_file bookkeeping on Windows) corrupting across `LFPy.Cell` instantiations. The fix implemented here is **one subprocess per population**: a worker script (`sweep_worker.py`) receives a pickled parameter dict, constructs N cells in a fresh Python + NEURON process, records the extracellular trace, applies the full detection pipeline, and writes a result pickle back before exiting. The parent process loops over the grid, launching subprocesses serially.
 
-This incurs ~1–2 s subprocess-startup overhead per population but guarantees that NEURON state cannot drift. Run serially (`--workers 1`), the full sweep costs approximately 8–10 hours on a typical workstation; because the jobs are independent, additional workers can reduce wall-clock time when multiple cores are available.
+This incurs ~1–2 s subprocess-startup overhead per population but guarantees that NEURON state cannot drift. The total cost for the full sweep is approximately 8–10 hours on a typical workstation.
 
 
 ## 8. Outcome metrics
@@ -180,7 +180,7 @@ Outputs are time-stamped into a new run folder (`figures/run_<YYYYMMDD_HHMMSS>/`
 - Python 3.11, LFPy 2.3.6, NEURON 8.2, NumPy 1.26, SciPy 1.12, Matplotlib 3.8
 - Single-threaded (NEURON); sweep parallelism is at the subprocess level
 - Run on Windows 11, 10-core CPU
-- Active source: `lfpy_MUA_simulation.py` (reference single-run simulation, the behavioral source of truth), `sweep_worker.py` (per-population worker), `snr_vs_distance.py` (calibration); the refactored module/runner layout is described in Section 12
+- All source: `lfpy_sim.py` (main), `sweep_worker.py` (per-population worker), `snr_vs_distance.py` (calibration)
 - Each run produces a self-contained `run_<timestamp>/` folder with figures, raw arrays, and a reproducible parameter record
 
 ### 11.1 Portable paths and per-run provenance
@@ -190,53 +190,7 @@ The morphology and figure-output directories are resolved **relative to the scri
 Each sweep run additionally writes a `run_info.json` into its `run_<timestamp>/` folder, recording the git commit (and dirty flag), hostname, OS/platform, and the LFPy / NEURON / NumPy / SciPy / Matplotlib versions, alongside the sweep grid and seed scheme. Because the sweep is fully seeded, identical code and environment should reproduce identical results; this provenance record makes any run-to-run difference attributable to a specific code, package, or platform change.
 
 
-## 12. Refactored pipeline: code organization and reproducible workflow
-
-The simulation and analysis code was reorganized into a layered structure that separates a frozen reference implementation, reusable modules, sweep runners that persist their outputs, and plotting scripts that never re-run NEURON. This section documents the **implemented** infrastructure; the human-L5 contact-approach study in Section 12.6 is a planning scaffold only and has not been run.
-
-### 12.1 Code organization
-
-- **`code/Reference/`** — a frozen snapshot of the validated reference implementation (`lfpy_MUA_simulation.py`, `sweep_worker.py`, `check_env.py`, and a copy of these methods). These files are preserved as the behavioral source of truth and are not edited during refactoring.
-- **`code/old/`** — archived earlier scripts, retained for provenance and not part of the active pipeline.
-- **`code/mua_config.py`** — portable, repo-relative path and configuration helpers (morphology directory, default output directory) that avoid machine-specific hardcoded paths across macOS, Linux, and Windows.
-- **`code/mua_metrics.py`** — array-level signal metrics only (causal Butterworth filtering, MAD noise estimate, negative threshold-crossing detection with refractory collapse, SBP envelope, peak negative amplitude). This module does **not** import LFPy or NEURON, so the detection pipeline can be exercised on plain NumPy arrays.
-- **`code/mua_core.py`** — reusable simulation helpers (cell biophysics, synapse placement, electrode construction) aligned with the reference script. Importing it is side-effect free: it does not construct cells, run simulations, or change the working directory at import time.
-- **`code/run_reference_sweep.py`** — the reference-sweep runner (Section 12.2).
-- **`code/plot_reference_sweep.py`** — figure generation from saved outputs only (Section 12.4).
-- **`code/run_l5_approach_sweep.py`** — a planning scaffold for the future human-L5 contact-approach sweep (Section 12.6).
-
-### 12.2 Sweep execution and CPU subprocess parallelism
-
-`run_reference_sweep.py` coordinates jobs only; all NEURON/LFPy work remains in `sweep_worker.py`. Each job — one (jitter, distance, cell-count, repeat) grid point — is dispatched to a **fresh worker subprocess**, preserving the per-population NEURON state isolation described in Section 7.2. Independent jobs run concurrently up to a configurable worker count (`--workers`), so the sweep can use multiple CPU cores while each population/repeat still executes in its own clean Python + NEURON process. A `--dry-run` mode prints the planned jobs, grid, and output location without launching workers, and `--smoke` selects a tiny grid for quick end-to-end checks.
-
-### 12.3 Resumable per-job outputs
-
-Each worker writes its result to a dedicated per-job file before any aggregation step, and the runner builds the aggregate arrays only once every job result is present. This makes the sweep **resumable**: with `--resume`, jobs whose result files already exist are skipped rather than recomputed or overwritten, and the runner refuses to clobber an existing aggregate. Final results are saved as a combined `.npz` (per-metric arrays indexed jitter × distance × cell-count × repeat) and a flat `.csv` (one row per job). A `run_info.json` is written once per run (see Section 11.1), additionally recording the sweep mode, grid, and seed scheme as provenance.
-
-### 12.4 Deterministic seeds
-
-Reproducibility-critical seeds in `run_reference_sweep.py` no longer use Python's built-in `hash(...)`, whose per-process salting makes it unstable across processes and machines. Instead, seeds are derived with a stable `hashlib` (SHA-256) helper: structured fields are joined, hashed, and the leading digest bytes are reduced into a NumPy-compatible seed. The layout/noise seed for a job depends on `distance_index`, `n_cell_index`, and `repeat`, and **excludes** the jitter value. All jitter values at a given (distance, cell-count, repeat) grid point therefore share the identical cell layout and noise realization, preserving exactly the common-random-numbers paired-comparison design of Section 7.1 while keeping seeds stable across processes, machines, and Python sessions.
-
-### 12.5 Plotting workflow
-
-`plot_reference_sweep.py` loads a saved aggregate `.npz` (or a run directory containing one) and writes static figures — currently threshold-crossings and detection-probability heatmaps, plus a peak-SBP heatmap when that field is present — into a `figures/` subfolder of the run directory. It does **not** import LFPy or NEURON and runs no simulations, so saved sweeps can be re-plotted without repeating the expensive NEURON work.
-
-### 12.6 Planned (scaffolded) human-L5 contact-approach sweep
-
-> **Status: planned / scaffold only — not yet implemented and not run.** `code/run_l5_approach_sweep.py` currently defines the intended target geometry and prints a job plan under `--dry-run`; any non-dry-run invocation exits without simulating. It does not import LFPy or NEURON and performs no biophysical simulation.
-
-The intended scientific target, as encoded in the scaffold, is a contact-approach study in which a recording site is advanced toward a dense cortical population:
-
-- **Population:** human L5 pyramidal cells
-- **Voxel:** 300 × 300 × 300 µm
-- **Cell count:** approximately 500 (500 in the current scaffold constant)
-- **Orientation:** apical dendrites oriented "north", basal dendrites "south"
-- **Contact approach:** beginning at 400 µm and stepping inward by 33 µm, i.e. {400, 367, 334, 301, 268, 235, 202, 169, 136, 103, 70, 37, 4} µm
-
-A reduced smoke configuration (10 cells; contact distances 400/202/4 µm; one repeat) is defined for future quick checks. No biophysical model, full 500-cell simulation, validation, or result for this target has been implemented or produced; the methods and any results in the preceding sections pertain to the reference sweep, not to this planned study.
-
-
-## 13. Key references
+## 12. Key references
 
 - **Buzsáki (2004)**, *Nat Neurosci*, "Large-scale recording of neuronal ensembles" — MUA detection radius concepts
 - **Buzsáki, Anastassiou & Koch (2012)**, *Nat Rev Neurosci*, "The origin of extracellular fields and currents" — biophysical theory
